@@ -127,7 +127,7 @@ last_binding_trigger: u64 = 0,
 /// The terminal IO handler.
 io: termio.Termio,
 io_thread: termio.Thread,
-io_thr: std.Thread,
+io_thr: ?std.Thread = null,
 
 /// Terminal inspector
 inspector: ?*inspectorpkg.Inspector = null,
@@ -493,10 +493,12 @@ pub fn init(
     } else config_original;
 
     // Get our configuration
+    log.debug("surface init: deriving config", .{});
     var derived_config = try DerivedConfig.init(alloc, config);
     errdefer derived_config.deinit();
 
     // Initialize our renderer with our initialized surface.
+    log.debug("surface init: renderer surfaceInit", .{});
     try Renderer.surfaceInit(rt_surface);
 
     // Determine our DPI configurations so we can properly configure
@@ -554,6 +556,7 @@ pub fn init(
     };
 
     // Create our terminal grid with the initial size
+    log.debug("surface init: creating renderer", .{});
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
     var renderer_impl = try Renderer.init(alloc, .{
         .config = try .init(alloc, config),
@@ -571,6 +574,7 @@ pub fn init(
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
+    log.debug("surface init: creating render thread", .{});
     var render_thread = try rendererpkg.Thread.init(
         alloc,
         config,
@@ -616,7 +620,7 @@ pub fn init(
         .keyboard = .{},
         .io = undefined,
         .io_thread = io_thread,
-        .io_thr = undefined,
+        .io_thr = null,
         .size = size,
         .config = derived_config,
 
@@ -675,6 +679,7 @@ pub fn init(
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
+        log.debug("surface init: initializing termio (scrollback replay happens here)", .{});
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
@@ -685,6 +690,10 @@ pub fn init(
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .initial_scrollback_path = if (comptime @hasDecl(apprt.runtime.Surface, "initialScrollbackPath"))
+                rt_surface.initialScrollbackPath()
+            else
+                null,
         });
     }
     // Outside the block, IO has now taken ownership of our temporary state
@@ -692,6 +701,7 @@ pub fn init(
     errdefer self.io.deinit();
 
     // Report initial cell size on surface creation
+    log.debug("surface init: termio done, reporting cell size", .{});
     _ = try rt_app.performAction(
         .{ .surface = self },
         .cell_size,
@@ -715,13 +725,16 @@ pub fn init(
     // init stuff we should get rid of this. But this is required because
     // sizeCallback does retina-aware stuff we don't do here and don't want
     // to duplicate.
+    log.debug("surface init: resizing", .{});
     try self.resize(self.size.screen);
 
     // Give the renderer one more opportunity to finalize any surface
     // setup on the main thread prior to spinning up the rendering thread.
+    log.debug("surface init: finalizing renderer", .{});
     try renderer_impl.finalizeSurfaceInit(rt_surface);
 
     // Start our renderer thread
+    log.debug("surface init: spawning renderer thread", .{});
     self.renderer_thr = try std.Thread.spawn(
         .{},
         rendererpkg.Thread.threadMain,
@@ -729,13 +742,13 @@ pub fn init(
     );
     self.renderer_thr.setName(global.io(), "renderer") catch {};
 
-    // Start our IO thread
-    self.io_thr = try std.Thread.spawn(
-        .{},
-        termio.Thread.threadMain,
-        .{ &self.io_thread, &self.io },
-    );
-    self.io_thr.setName(global.io(), "io") catch {};
+    // Start our IO thread unless we have scrollback to replay. In that
+    // case we defer until the first real size is known so the replay
+    // and subprocess both start at the correct terminal dimensions.
+    if (self.io.initial_scrollback_path == null) {
+        try self.startIO();
+    }
+    log.debug("surface init: complete", .{});
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -812,10 +825,10 @@ pub fn deinit(self: *Surface) void {
     }
 
     // Stop our IO thread
-    {
+    if (self.io_thr) |thr| {
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
+        thr.join();
     }
 
     // We need to deinit AFTER everything is stopped, since there are
@@ -2477,6 +2490,43 @@ fn queueRender(self: *Surface) !void {
     try self.renderer_thread.wakeup.notify();
 }
 
+/// Start the IO thread. This spawns the thread that runs the terminal
+/// IO event loop, which in turn starts the subprocess.
+fn startIO(self: *Surface) !void {
+    assert(self.io_thr == null);
+
+    // Sync the current size to the IO layer so the terminal starts at
+    // the correct dimensions. This matters when IO start was deferred
+    // until the first real size was known.
+    {
+        self.io.size = self.size;
+        const grid_size = self.size.grid();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.io.terminal.resize(
+            self.alloc,
+            .{
+                .cols = grid_size.columns,
+                .rows = grid_size.rows,
+                .cell_size_px = .{
+                    .width = self.size.cell.width,
+                    .height = self.size.cell.height,
+                },
+            },
+        ) catch |err| {
+            log.warn("error resizing terminal for deferred IO start err={}", .{err});
+        };
+    }
+
+    log.debug("surface init: spawning io thread", .{});
+    self.io_thr = try std.Thread.spawn(
+        .{},
+        termio.Thread.threadMain,
+        .{ &self.io_thread, &self.io },
+    );
+    self.io_thr.?.setName(global.io(), "io") catch {};
+}
+
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
@@ -2493,6 +2543,12 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+
+    // If the IO thread hasn't started yet, we were deferring until the
+    // first real size arrived (for scrollback replay). Start it now.
+    if (self.io_thr == null) {
+        try self.startIO();
+    }
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
@@ -5771,24 +5827,11 @@ fn writeScreenFile(
             return;
         };
 
-        const ScreenFormatter = terminal.formatter.ScreenFormatter;
-        var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
-            .emit = switch (write_screen.emit) {
-                .plain => .plain,
-                .vt => .vt,
-                .html => .html,
-            },
-            .unwrap = true,
-            .trim = false,
-            .background = self.io.terminal.colors.background.get(),
-            .foreground = self.io.terminal.colors.foreground.get(),
-            .palette = &self.io.terminal.colors.palette.current,
-        });
-        formatter.content = .{ .selection = sel.ordered(
-            self.io.terminal.screens.active,
-            .forward,
-        ) };
-        try formatter.format(buf_writer);
+        try self.formatSelection(sel, switch (write_screen.emit) {
+            .plain => .plain,
+            .vt => .vt,
+            .html => .html,
+        }, buf_writer);
     }
     try buf_writer.flush();
 
@@ -5857,6 +5900,98 @@ pub const CompleteClipboard = struct {
     /// clipboard protocol requests carrying a password).
     remember: bool = false,
 };
+/// Write the surface's scrollback and screen content to the given path as
+/// VT sequences. Used for window state restoration. The caller must ensure
+/// the directory exists. When the alternate screen is active, the primary
+/// screen's history is saved instead.
+pub fn writeScrollbackFile(self: *Surface, path: []const u8) !void {
+    // When the alternate screen is active (vim, htop, etc.) we save the
+    // primary screen's history — the alternate screen has no scrollback.
+    const on_alt = self.io.terminal.screens.active_key == .alternate;
+    const screen = if (on_alt)
+        self.io.terminal.screens.get(.primary) orelse return error.NoScrollback
+    else
+        self.io.terminal.screens.active;
+
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        const pages = &screen.pages;
+        // On alternate screen, only save history (no active screen to save).
+        // Otherwise save everything.
+        const bottom = if (on_alt)
+            pages.getBottomRight(.history)
+        else
+            pages.getBottomRight(.screen);
+
+        if (bottom == null) return error.NoScrollback;
+    }
+
+    var file = try std.Io.Dir.createFileAbsolute(
+        global.io(),
+        path,
+        .{ .permissions = @enumFromInt(0o600) },
+    );
+    defer file.close(global.io());
+
+    var buf: [4096]u8 = undefined;
+    var file_writer = file.writer(global.io(), &buf);
+    var buf_writer = &file_writer.interface;
+
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        const pages = &screen.pages;
+        const top = pages.getTopLeft(.history);
+        const bottom = if (on_alt)
+            pages.getBottomRight(.history) orelse unreachable
+        else
+            pages.getBottomRight(.screen) orelse unreachable;
+        const sel = terminal.Selection.init(top, bottom, false);
+
+        const ScreenFormatter = terminal.formatter.ScreenFormatter;
+        var formatter: ScreenFormatter = .init(screen, .{
+            .emit = .vt,
+            .unwrap = true,
+            .trim = false,
+            .background = self.io.terminal.colors.background.get(),
+            .foreground = self.io.terminal.colors.foreground.get(),
+            .palette = &self.io.terminal.colors.palette.current,
+        });
+        formatter.content = .{ .selection = sel.ordered(
+            screen,
+            .forward,
+        ) };
+        try formatter.format(buf_writer);
+    }
+    try buf_writer.flush();
+}
+
+/// Format a terminal selection to a writer using ScreenFormatter.
+/// Caller must hold renderer_state.mutex.
+fn formatSelection(
+    self: *const Surface,
+    sel: terminal.Selection,
+    emit: terminal.formatter.Format,
+    writer: *std.Io.Writer,
+) !void {
+    const ScreenFormatter = terminal.formatter.ScreenFormatter;
+    var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
+        .emit = emit,
+        .unwrap = true,
+        .trim = false,
+        .background = self.io.terminal.colors.background.get(),
+        .foreground = self.io.terminal.colors.foreground.get(),
+        .palette = &self.io.terminal.colors.palette.current,
+    });
+    formatter.content = .{ .selection = sel.ordered(
+        self.io.terminal.screens.active,
+        .forward,
+    ) };
+    try formatter.format(writer);
+}
 
 /// Call this to complete a clipboard request sent to apprt. This should
 /// only be called once for each request.

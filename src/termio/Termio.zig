@@ -12,6 +12,8 @@ const EnvMap = std.process.Environ.Map;
 const posix = std.posix;
 const termio = @import("../termio.zig");
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
+const stream_replay = @import("stream_replay.zig");
+const ReplayHandler = stream_replay.Handler;
 const terminalpkg = @import("../terminal/main.zig");
 const global = @import("../global.zig");
 const xev = global.xev;
@@ -68,6 +70,11 @@ terminal_stream: StreamHandler.Stream,
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
+
+/// Path to a scrollback VT file to replay after the surface reports
+/// its true size. Owned by Termio (heap-duped during init), freed
+/// after replay.
+initial_scrollback_path: ?[:0]const u8 = null,
 
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
@@ -327,6 +334,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .allocator = alloc,
             .handler = handler,
         }),
+        .initial_scrollback_path = if (opts.initial_scrollback_path) |p|
+            alloc.dupeZ(u8, p) catch null
+        else
+            null,
         .thread_enter_state = thread_enter_state,
     };
 }
@@ -339,6 +350,9 @@ pub fn deinit(self: *Termio) void {
 
     // Clear any StreamHandler state
     self.terminal_stream.deinit();
+
+    // Free any unreplayed scrollback path
+    if (self.initial_scrollback_path) |path| self.alloc.free(path);
 
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
@@ -374,6 +388,14 @@ pub fn threadEnter(
         .mailbox = &self.mailbox,
         .backend = undefined, // Backend must replace this on threadEnter
     };
+
+    // Replay scrollback history before starting the subprocess so that
+    // restored content appears before any new shell output.
+    if (self.initial_scrollback_path) |path| {
+        self.initial_scrollback_path = null;
+        self.replayScrollback(path);
+        self.alloc.free(path);
+    }
 
     // Setup our backend
     try self.backend.threadEnter(self.alloc, self, data);
@@ -531,6 +553,75 @@ pub fn resize(
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
+}
+
+/// Replay a scrollback VT file into the terminal. Called from the
+/// IO thread's coalesce callback after resize has been applied.
+///
+/// Uses a replay-specific stream handler that applies terminal state
+/// without writing to any mailbox, avoiding deadlocks. Side effects
+/// like title and bell are captured and applied after replay.
+pub fn replayScrollback(self: *Termio, path: [:0]const u8) void {
+    const file = std.Io.Dir.openFileAbsolute(global.io(), path, .{}) catch |err| {
+        log.warn("failed to open scrollback file err={}", .{err});
+        return;
+    };
+    defer file.close(global.io());
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    var handler: ReplayHandler = .init(&self.terminal);
+    var replay_stream: stream_replay.Stream = .init(.{
+        .allocator = self.alloc,
+        .handler = handler,
+    });
+    defer replay_stream.deinit();
+
+    var buf: [4096]u8 = undefined;
+    var file_reader = file.reader(global.io(), &buf);
+    const reader = &file_reader.interface;
+    while (true) {
+        const chunk = reader.peekGreedy(1) catch break;
+        replay_stream.nextSlice(chunk);
+        reader.toss(chunk.len);
+    }
+
+    // Reset modes that may have been left enabled by the saved VT
+    // content so the new shell session starts clean.
+    replay_stream.nextSlice(
+        "\x1b[m" ++ // SGR reset
+            "\x1b[?9l" ++ // mouse x10 off
+            "\x1b[?1000l" ++ // mouse normal off
+            "\x1b[?1002l" ++ // mouse button off
+            "\x1b[?1003l" ++ // mouse any off
+            "\x1b[?1005l" ++ // mouse format utf8 off
+            "\x1b[?1006l" ++ // mouse format sgr off
+            "\x1b[?1015l" ++ // mouse format urxvt off
+            "\x1b[?1016l" ++ // mouse format sgr_pixels off
+            "\x1b[?2004l" ++ // bracketed paste off
+            "\x1b[?25h" ++ // cursor visible
+            "\r\n",
+    );
+
+    // Apply captured side effects after replay
+    handler = replay_stream.handler;
+
+    if (handler.getTitle()) |title| {
+        var title_buf: [256]u8 = undefined;
+        @memcpy(title_buf[0..title.len], title);
+        title_buf[title.len] = 0;
+        const msg: apprt.surface.Message = .{ .set_title = title_buf };
+        if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+            self.renderer_state.mutex.unlock(global.io());
+            defer self.renderer_state.mutex.lockUncancelable(global.io());
+            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+        }
+    }
+
+    // bell_pending is captured but not forwarded here — ring_bell
+    // would trigger the audible alert, not just the visual indicator.
+    // A silent bell indicator could be added as a future enhancement.
 }
 
 /// Make a size report.

@@ -516,6 +516,7 @@ typedef struct {
   ghostty_env_var_s* env_vars;
   size_t env_var_count;
   const char* initial_input;
+  const char* initial_scrollback_path;
   bool wait_after_command;
   ghostty_surface_context_e context;
 } ghostty_surface_config_s;
@@ -1170,6 +1171,7 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_write_scrollback(ghostty_surface_t, const char*);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
