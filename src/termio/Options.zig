@@ -39,3 +39,8 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Path to a VT-serialized scrollback file to replay into the terminal
+/// during init, before the PTY starts. Used for state restoration.
+/// Caller retains ownership; this is only read during init.
+initial_scrollback_path: ?[:0]const u8 = null,
