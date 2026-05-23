@@ -458,6 +458,10 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// Path to the scrollback replay file set during surface init. Only
+    /// valid during the call to core_surface.init(); cleared afterwards.
+    initial_scrollback_path: ?[*:0]const u8 = null,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -493,6 +497,10 @@ pub const Surface = struct {
 
         /// Input to send to the command after it is started.
         initial_input: ?[*:0]const u8 = null,
+
+        /// Path to a VT-serialized scrollback file to replay into the
+        /// terminal before the PTY starts. Used for state restoration.
+        initial_scrollback_path: ?[*:0]const u8 = null,
 
         /// Wait after the command exits
         wait_after_command: bool = false,
@@ -612,6 +620,12 @@ pub const Surface = struct {
             config.@"wait-after-command" = true;
         }
 
+        // Store the scrollback path so initialScrollbackPath() can return it
+        // to Surface.zig during core_surface.init(). The pointer is owned by
+        // the caller and remains valid for the duration of this init call.
+        self.initial_scrollback_path = opts.initial_scrollback_path;
+        defer self.initial_scrollback_path = null;
+
         // Initialize our surface right away. We're given a view that is
         // ready to use.
         try self.core_surface.init(
@@ -643,6 +657,13 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+    }
+
+    /// Returns the scrollback replay path set during surface initialization.
+    /// Only valid during the core_surface.init() call; null at all other times.
+    pub fn initialScrollbackPath(self: *const Surface) ?[:0]const u8 {
+        const ptr = self.initial_scrollback_path orelse return null;
+        return std.mem.span(ptr);
     }
 
     /// Initialize the inspector instance. A surface can only have one
@@ -1818,6 +1839,21 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free(ptr: *Surface) void {
         ptr.app.closeSurface(ptr);
+    }
+
+    /// Write the surface's scrollback history to a file as VT sequences.
+    /// Returns true on success. Used for window state restoration.
+    export fn ghostty_surface_write_scrollback(
+        surface: *Surface,
+        path: [*:0]const u8,
+    ) bool {
+        surface.core_surface.writeScrollbackFile(std.mem.span(path)) catch |err| {
+            // NoScrollback is not an error - alternate screen has no scrollback to save
+            if (err == error.NoScrollback) return false;
+            log.warn("failed to write scrollback file err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// Returns the userdata associated with the surface.
