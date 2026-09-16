@@ -517,6 +517,20 @@ typedef struct {
   size_t env_var_count;
   const char* initial_input;
   const char* initial_scrollback_path;
+  // A descriptor, usually one end of a socketpair(2), that the embedder
+  // drives this surface's IO with. -1 runs a command on a pty as usual.
+  // Otherwise no command is run: bytes written to the far end are parsed
+  // as terminal output. Keys and text input are not written back; they
+  // arrive as GHOSTTY_ACTION_MIRROR_KEY and GHOSTTY_ACTION_MIRROR_TEXT, and
+  // replies to queries are left to whatever produced the output. What is
+  // written back is mouse reports, focus reports, and the bytes of csi:,
+  // esc:, and cursor-key bindings. The surface keeps its own duplicate,
+  // so the embedder may close this descriptor at any time after
+  // ghostty_surface_new returns; closing the far end of the connection
+  // ends the stream. The "no descriptor" value is -1, not 0:
+  // build the struct with ghostty_surface_config_new() rather than zeroing
+  // it, or descriptor 0 (stdin) becomes the mirror source.
+  int mirror_io_fd;
   bool wait_after_command;
   ghostty_surface_context_e context;
 } ghostty_surface_config_s;
@@ -806,6 +820,35 @@ typedef struct {
   uint32_t height;
 } ghostty_action_cell_size_s;
 
+// apprt.action.MirrorResized
+typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+} ghostty_action_mirror_resized_s;
+
+// apprt.action.MirrorKey
+typedef struct {
+  ghostty_input_key_e key;
+  ghostty_input_mods_e mods;
+  // The key's codepoint with no modifiers applied, or 0 when unknown.
+  uint32_t unshifted_codepoint;
+  // Whether alt counts as alt for this event; on macOS
+  // macos-option-as-alt decides. False when alt is not pressed.
+  bool alt_is_alt;
+  // The key is part of a dead-key composition still in progress.
+  bool composing;
+  // NUL-terminated text the key produced; valid only during the callback.
+  // Text containing a NUL is cut at the NUL.
+  const char* utf8;
+} ghostty_action_mirror_key_s;
+
+// apprt.action.MirrorText
+typedef struct {
+  // Not NUL-terminated; valid only during the callback.
+  const char* text;
+  uintptr_t len;
+} ghostty_action_mirror_text_s;
+
 // renderer.Health
 typedef enum {
   GHOSTTY_RENDERER_HEALTH_HEALTHY,
@@ -1010,6 +1053,16 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+  // Fires only for a surface created with mirror_io_fd, after its terminal
+  // grid has been resized. Payload: mirror_resized, the new grid in cells.
+  GHOSTTY_ACTION_MIRROR_RESIZED,
+  // Fire only for a surface created with mirror_io_fd, in input order.
+  // Such a surface never writes keys or committed text to the descriptor;
+  // it hands them over here instead. MIRROR_KEY: a press or repeat after
+  // keybindings, payload mirror_key. MIRROR_TEXT: text from a text:
+  // binding or ghostty_surface_text, payload mirror_text.
+  GHOSTTY_ACTION_MIRROR_KEY,
+  GHOSTTY_ACTION_MIRROR_TEXT,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1053,6 +1106,9 @@ typedef union {
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
   ghostty_action_open_config_e open_config;
+  ghostty_action_mirror_resized_s mirror_resized;
+  ghostty_action_mirror_key_s mirror_key;
+  ghostty_action_mirror_text_s mirror_text;
 } ghostty_action_u;
 
 typedef struct {

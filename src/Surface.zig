@@ -643,37 +643,48 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+        // An embedder can hand us a descriptor and drive this surface's
+        // IO itself. When it does we never run a command, so none of the
+        // subprocess environment below applies.
+        const mirror_fd: ?std.posix.fd_t = if (comptime @hasDecl(
+            apprt.runtime.Surface,
+            "mirrorIoFd",
+        )) rt_surface.mirrorIoFd() else null;
+
+        var io_backend: termio.Backend = if (mirror_fd) |fd| .{
+            .mirror = try termio.Mirror.init(.{ .fd = fd }),
+        } else backend: {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+            };
+            errdefer env.deinit();
+
+            // don't leak GHOSTTY_LOG to any subprocesses
+            _ = env.orderedRemove("GHOSTTY_LOG");
+
+            var buf: [18]u8 = undefined;
+            try env.put(
+                "GHOSTTY_SURFACE_ID",
+                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+            );
+
+            break :backend .{ .exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global.resourcesDir().host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            }) };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        _ = env.orderedRemove("GHOSTTY_LOG");
-
-        var buf: [18]u8 = undefined;
-        try env.put(
-            "GHOSTTY_SURFACE_ID",
-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-        );
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global.resourcesDir().host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer io_backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -684,7 +695,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -742,10 +753,12 @@ pub fn init(
     );
     self.renderer_thr.setName(global.io(), "renderer") catch {};
 
-    // Start our IO thread unless we have scrollback to replay. In that
-    // case we defer until the first real size is known so the replay
-    // and subprocess both start at the correct terminal dimensions.
-    if (self.io.initial_scrollback_path == null) {
+    // Start our IO thread unless we have scrollback to replay or an
+    // embedder-driven mirror. In those cases we defer until the first real
+    // size is known so the replay, the subprocess, or the bytes already
+    // waiting on the mirror descriptor all start at the correct terminal
+    // dimensions.
+    if (self.io.initial_scrollback_path == null and self.io.backend != .mirror) {
         try self.startIO();
     }
     log.debug("surface init: complete", .{});
@@ -1151,6 +1164,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .mirror_resized => |v| {
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .mirror_resized,
+                v,
+            ) catch |err| {
+                log.warn("apprt failed to report mirror resize err={}", .{err});
+            };
+        },
+
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();
@@ -1351,6 +1374,10 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+
+        // A mirror has no child process, so there is no command to
+        // name and nothing that could have exited abnormally.
+        .mirror => return,
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -2537,15 +2564,16 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
         .height = size.height,
     };
 
-    // Update our screen size, but only if it actually changed. And if
-    // the screen size didn't change, then our grid size could not have
-    // changed, so we just return.
-    if (self.size.screen.equals(new_screen_size)) return;
-
-    try self.resize(new_screen_size);
+    // Update our screen size, but only if it actually changed. If the
+    // screen size didn't change, then our grid size could not have
+    // changed either.
+    if (!self.size.screen.equals(new_screen_size)) {
+        try self.resize(new_screen_size);
+    }
 
     // If the IO thread hasn't started yet, we were deferring until the
-    // first real size arrived (for scrollback replay). Start it now.
+    // first real size arrived (for scrollback replay or a mirror). Start
+    // it now, even when that size equals the one we were created with.
     if (self.io_thr == null) {
         try self.startIO();
     }
@@ -2862,8 +2890,10 @@ pub fn keyCallback(
     };
 
     // Encode and send our key. If we didn't encode anything, then we
-    // return the effect as ignored.
-    if (try self.encodeKey(
+    // return the effect as ignored. A mirror hands the key over instead.
+    if (self.io.backend == .mirror) {
+        if (!try self.mirrorKey(event)) return .ignored;
+    } else if (try self.encodeKey(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |write_req| {
@@ -3322,6 +3352,59 @@ fn encodeKey(
     return write_req;
 }
 
+/// Hand a key to the embedder driving a mirror instead of encoding it.
+/// Our terminal state is a copy of one another emulator owns, so the
+/// modes an encoder reads may be stale or unknown; that emulator encodes
+/// the key with the real ones. Returns false for a release, which the far
+/// side has no use for.
+fn mirrorKey(self: *Surface, event: input.KeyEvent) !bool {
+    if (event.action == .release) return false;
+
+    const alt_is_alt = event.mods.alt and alt: {
+        if (comptime builtin.os.tag != .macos) break :alt true;
+        break :alt switch (self.encodeKeyOpts().macos_option_as_alt) {
+            .true => true,
+            .false => false,
+            .left => event.mods.sides.alt == .left,
+            .right => event.mods.sides.alt == .right,
+        };
+    };
+
+    // The C payload carries the text NUL-terminated.
+    const text = if (std.mem.indexOfScalar(u8, event.utf8, 0)) |end|
+        event.utf8[0..end]
+    else
+        event.utf8;
+    var stack = std.heap.stackFallback(256, self.alloc);
+    const alloc = stack.get();
+    const utf8 = try alloc.dupeZ(u8, text);
+    defer alloc.free(utf8);
+
+    _ = try self.rt_app.performAction(
+        .{ .surface = self },
+        .mirror_key,
+        .{
+            .key = event.key,
+            .mods = event.mods,
+            .unshifted_codepoint = event.unshifted_codepoint,
+            .utf8 = utf8,
+            .alt_is_alt = alt_is_alt,
+            .composing = event.composing,
+        },
+    );
+    return true;
+}
+
+/// Hand text to the embedder driving a mirror instead of writing it. See
+/// `mirrorKey`; both go through the apprt so they stay in input order.
+fn mirrorText(self: *Surface, text: []const u8) !void {
+    _ = try self.rt_app.performAction(
+        .{ .surface = self },
+        .mirror_text,
+        .{ .text = text },
+    );
+}
+
 fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
@@ -3354,6 +3437,7 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    if (self.io.backend == .mirror) return try self.mirrorText(text);
     try self.completeClipboardPaste(text, true);
 }
 
@@ -4918,7 +5002,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 );
                 return true;
             };
-            self.queueIo(try termio.Message.writeReq(
+            if (self.io.backend == .mirror) {
+                try self.mirrorText(text);
+            } else self.queueIo(try termio.Message.writeReq(
                 self.alloc,
                 text,
             ), .unlocked);
@@ -6335,6 +6421,9 @@ fn completeClipboardPasteEvent(
     available: []const []const u8,
 ) !bool {
     if (self.readonly) return false;
+    // A mirror's embedder pastes on the far side, which announces the
+    // paste in whatever form the program there asked for.
+    if (self.io.backend == .mirror) return false;
 
     const kitty_clipboard = terminal.kitty.clipboard;
     const location: terminal.clipboard.Location = switch (clipboard) {

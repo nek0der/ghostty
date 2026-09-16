@@ -51,6 +51,16 @@ pub const StreamHandler = struct {
     /// The clipboard write access configuration.
     clipboard_write: configpkg.ClipboardAccess,
 
+    /// Drop every reply this handler would send back to the running
+    /// application. Set when the surface only mirrors a screen that
+    /// another terminal emulator owns: that emulator has already
+    /// answered the application on the real tty, and a second answer
+    /// describes the wrong terminal. Notably it is the only answer the
+    /// application gets for anything the other emulator does not
+    /// implement, which is how it ends up negotiating a protocol the
+    /// transport cannot carry.
+    suppress_reports: bool = false,
+
     /// Maximum total decoded bytes per Kitty clipboard protocol
     /// (OSC 5522) write transaction; exceeding it aborts with EFBIG.
     clipboard_write_limit: usize,
@@ -141,6 +151,20 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (self.suppress_reports) switch (msg) {
+            // Terminal state the stream itself drives has to keep flowing:
+            // the synchronized-output reset timer and linefeed mode are not
+            // answers to the application, and dropping them would leave a
+            // pane frozen after `?2026h` with no `?2026l`.
+            .start_synchronized_output, .linefeed_mode => {},
+            // Everything else here is a reply to a query (DA, CPR, size,
+            // color scheme, ...). Something on the far side of the
+            // descriptor already answers those.
+            else => {
+                msg.deinit();
+                return;
+            },
+        };
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -1001,8 +1025,9 @@ pub const StreamHandler = struct {
             else => .standard,
         };
 
-        // Get clipboard contents
+        // Get clipboard contents. The answer is a reply like any other.
         if (data.len == 1 and data[0] == '?') {
+            if (self.suppress_reports) return;
             self.surfaceMessageWriter(.{ .clipboard_read = clipboard_type });
             return;
         }
@@ -1083,6 +1108,9 @@ pub const StreamHandler = struct {
         terminator: terminal.osc.Terminator,
     ) !void {
         const kitty_clipboard = terminal.kitty.clipboard;
+
+        // The data comes back as a reply, which a mirror never sends.
+        if (self.suppress_reports) return;
 
         // Everything about the request, including the request struct
         // itself, lives in a single arena that crosses to the surface
@@ -1792,7 +1820,7 @@ pub const StreamHandler = struct {
             .csi_14_t => self.messageWriter(.{ .size_report = .csi_14_t }),
             .csi_16_t => self.messageWriter(.{ .size_report = .csi_16_t }),
             .csi_18_t => self.messageWriter(.{ .size_report = .csi_18_t }),
-            .csi_21_t => self.surfaceMessageWriter(.{ .report_title = .csi_21_t }),
+            .csi_21_t => if (!self.suppress_reports) self.surfaceMessageWriter(.{ .report_title = .csi_21_t }),
         }
     }
 

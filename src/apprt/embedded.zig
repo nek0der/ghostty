@@ -462,6 +462,11 @@ pub const Surface = struct {
     /// valid during the call to core_surface.init(); cleared afterwards.
     initial_scrollback_path: ?[*:0]const u8 = null,
 
+    /// The descriptor the embedder drives this surface's IO with, set
+    /// during surface init. Only valid during the call to
+    /// core_surface.init(); reset afterwards.
+    mirror_io_fd: c_int = -1,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -501,6 +506,16 @@ pub const Surface = struct {
         /// Path to a VT-serialized scrollback file to replay into the
         /// terminal before the PTY starts. Used for state restoration.
         initial_scrollback_path: ?[*:0]const u8 = null,
+
+        /// A descriptor, usually one end of a socketpair(2), that the
+        /// embedder drives this surface's IO with. When this is not -1
+        /// no command is run and no pty is allocated: bytes written to
+        /// the far end are parsed as terminal output. Keys and text input
+        /// are handed to the embedder as actions instead of being written
+        /// back (see `apprt.action.MirrorKey`); only mouse and focus
+        /// reports and raw-byte bindings are. The embedder owns the
+        /// descriptor and closes it to end the stream.
+        mirror_io_fd: c_int = -1,
 
         /// Wait after the command exits
         wait_after_command: bool = false,
@@ -626,6 +641,10 @@ pub const Surface = struct {
         self.initial_scrollback_path = opts.initial_scrollback_path;
         defer self.initial_scrollback_path = null;
 
+        // Same for the mirror descriptor, read back by mirrorIoFd().
+        self.mirror_io_fd = opts.mirror_io_fd;
+        defer self.mirror_io_fd = -1;
+
         // Initialize our surface right away. We're given a view that is
         // ready to use.
         try self.core_surface.init(
@@ -664,6 +683,14 @@ pub const Surface = struct {
     pub fn initialScrollbackPath(self: *const Surface) ?[:0]const u8 {
         const ptr = self.initial_scrollback_path orelse return null;
         return std.mem.span(ptr);
+    }
+
+    /// Returns the descriptor the embedder drives this surface's IO with,
+    /// set during surface initialization. Only valid during the
+    /// core_surface.init() call; null at all other times.
+    pub fn mirrorIoFd(self: *const Surface) ?std.posix.fd_t {
+        if (self.mirror_io_fd < 0) return null;
+        return @intCast(self.mirror_io_fd);
     }
 
     /// Initialize the inspector instance. A surface can only have one

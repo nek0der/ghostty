@@ -147,6 +147,10 @@ pub const Message = union(enum) {
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,
 
+    /// The terminal of a mirror surface has been resized to this grid.
+    /// Sent only by the mirror backend, after the resize is applied.
+    mirror_resized: apprt.action.MirrorResized,
+
     /// Search progress update
     search_total: ?usize,
 

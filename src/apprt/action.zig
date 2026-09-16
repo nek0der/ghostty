@@ -357,6 +357,24 @@ pub const Action = union(Key) {
     /// Move a tab to a new window.
     move_tab_to_new_window,
 
+    /// The terminal of a mirror surface has been resized. Fires only for
+    /// surfaces whose IO an embedder drives through a descriptor, after
+    /// the terminal grid has taken the new size, so bytes the embedder
+    /// writes from now on are parsed at that size.
+    mirror_resized: MirrorResized,
+
+    /// A key was pressed or repeated on a mirror surface. The surface
+    /// does not encode it: the terminal state it holds is a copy, and the
+    /// modes an encoder reads (cursor keys, keypad, modifyOtherKeys, the
+    /// Kitty flags) belong to the far side, which encodes with the real
+    /// ones. Fires after keybindings, never for a release.
+    mirror_key: MirrorKey,
+
+    /// Text was sent to a mirror surface by a `text:` binding or the
+    /// apprt's text callback. The surface does not write it, for the same
+    /// reason as `mirror_key`, and the two share one ordered path.
+    mirror_text: MirrorText,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -428,6 +446,9 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         move_tab_to_new_window,
+        mirror_resized,
+        mirror_key,
+        mirror_text,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -735,6 +756,70 @@ pub const InitialSize = extern struct {
 pub const CellSize = extern struct {
     width: u32,
     height: u32,
+};
+
+pub const MirrorResized = extern struct {
+    columns: u16,
+    rows: u16,
+};
+
+pub const MirrorKey = struct {
+    key: input.Key,
+    mods: input.Mods,
+
+    /// The key's codepoint with no modifiers applied, in the current
+    /// layout; 0 when the apprt does not know it.
+    unshifted_codepoint: u21,
+
+    /// The text the key produced. Valid only during the action.
+    utf8: [:0]const u8,
+
+    /// Whether the alt modifier counts as alt for this event, as the
+    /// encoder would decide it: on macOS `macos-option-as-alt` can make
+    /// Option a text modifier instead. False when alt is not pressed.
+    alt_is_alt: bool,
+
+    /// The key is part of a dead-key composition still in progress.
+    composing: bool,
+
+    // Sync with: ghostty_action_mirror_key_s
+    pub const C = extern struct {
+        key: input.Key,
+        mods: c_int,
+        unshifted_codepoint: u32,
+        alt_is_alt: bool,
+        composing: bool,
+        utf8: [*:0]const u8,
+    };
+
+    pub fn cval(self: MirrorKey) C {
+        return .{
+            .key = self.key,
+            .mods = @intCast(self.mods.int()),
+            .unshifted_codepoint = self.unshifted_codepoint,
+            .alt_is_alt = self.alt_is_alt,
+            .composing = self.composing,
+            .utf8 = self.utf8.ptr,
+        };
+    }
+};
+
+pub const MirrorText = struct {
+    /// Valid only during the action.
+    text: []const u8,
+
+    // Sync with: ghostty_action_mirror_text_s
+    pub const C = extern struct {
+        text: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: MirrorText) C {
+        return .{
+            .text = self.text.ptr,
+            .len = self.text.len,
+        };
+    }
 };
 
 pub const SetTitle = struct {
@@ -1065,6 +1150,37 @@ pub const OpenConfig = enum(c_int) {
         try lib.checkGhosttyHEnum(OpenConfig, "GHOSTTY_ACTION_OPEN_CONFIG_");
     }
 };
+
+test "MirrorKey.cval keeps sided mods and the text" {
+    const testing = std.testing;
+
+    const text: [:0]const u8 = "\u{e5}";
+    const event: MirrorKey = .{
+        .key = .key_a,
+        .mods = .{ .alt = true, .sides = .{ .alt = .right } },
+        .unshifted_codepoint = 'a',
+        .utf8 = text,
+        .alt_is_alt = false,
+        .composing = true,
+    };
+    const c = event.cval();
+    try testing.expectEqual(input.Key.key_a, c.key);
+    // GHOSTTY_MODS_ALT | GHOSTTY_MODS_ALT_RIGHT
+    try testing.expectEqual(@as(c_int, (1 << 2) | (1 << 8)), c.mods);
+    try testing.expectEqual(@as(u32, 'a'), c.unshifted_codepoint);
+    try testing.expect(!c.alt_is_alt);
+    try testing.expect(c.composing);
+    try testing.expectEqualStrings(text, std.mem.span(c.utf8));
+}
+
+test "MirrorText.cval keeps bytes past a NUL" {
+    const testing = std.testing;
+
+    const text = "a\x00b\n";
+    const c = (MirrorText{ .text = text }).cval();
+    try testing.expectEqual(text.len, c.len);
+    try testing.expectEqualStrings(text, c.text[0..c.len]);
+}
 
 test {
     _ = compat_testing.refAllDeclsRecursive(@This());

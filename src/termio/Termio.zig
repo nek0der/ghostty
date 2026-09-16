@@ -312,6 +312,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write = opts.config.clipboard_write,
         .clipboard_write_limit = opts.config.clipboard_write_limit,
         .enquiry_response = opts.config.enquiry_response,
+        .suppress_reports = backend == .mirror,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -531,6 +532,12 @@ pub fn resize(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
+        // Nothing redraws a mirrored prompt after a resize: the shell's
+        // own redraw already arrived through the descriptor, sized by the
+        // far end, and we cannot signal it again. Set here rather than once
+        // at start because a full reset and OSC 133 both rewrite the flag.
+        if (self.backend == .mirror) self.terminal.flags.shell_redraws_prompt = .false;
+
         // Update the size of our terminal state
         try self.terminal.resize(
             self.alloc,
@@ -545,7 +552,8 @@ pub fn resize(
         );
 
         // If we have size reporting enabled we need to send a report.
-        if (self.terminal.modes.get(.in_band_size_reports)) {
+        // A mirror leaves the report to the far side, which owns the size.
+        if (self.terminal.modes.get(.in_band_size_reports) and self.backend != .mirror) {
             try self.sizeReportLocked(td, .mode_2048);
         }
     }
@@ -553,6 +561,16 @@ pub fn resize(
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
+
+    // The embedder driving a mirror cannot see when the grid changes, and
+    // bytes it writes before then are parsed at the old size. Tell it once
+    // the terminal has the new grid, outside the lock the app thread takes.
+    if (self.backend == .mirror) {
+        _ = self.surface_mailbox.push(.{ .mirror_resized = .{
+            .columns = grid_size.columns,
+            .rows = grid_size.rows,
+        } }, .{ .forever = {} });
+    }
 }
 
 /// Replay a scrollback VT file into the terminal. Called from the
@@ -844,6 +862,9 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
+    // Reports reach a mirror from the apprt as well as from the stream;
+    // either way the far side answers for the terminal it owns.
+    if (self.backend == .mirror) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
@@ -872,6 +893,8 @@ pub fn visibilityReport(
     if (!force and !self.renderer_state.terminal.modes.get(.report_visibility)) {
         return;
     }
+    // See colorSchemeReportLocked.
+    if (self.backend == .mirror) return;
 
     var buf: [terminalpkg.device_status.max_visibility_report_encode_size]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
