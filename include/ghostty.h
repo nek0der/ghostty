@@ -1237,6 +1237,10 @@ GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+// Pin the padding per side (top, bottom, left, right) in points. A negative
+// value keeps the configured padding for that side. The pin survives config
+// reloads; pass all negatives to clear it.
+GHOSTTY_API void ghostty_surface_set_padding(ghostty_surface_t, int, int, int, int);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);

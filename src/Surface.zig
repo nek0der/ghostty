@@ -83,6 +83,11 @@ font_metrics: font.Metrics,
 /// a specific size.
 font_size_adjusted: bool,
 
+/// Per-side padding the embedder pinned via `setPaddingOverride`; null
+/// means the config's `window-padding-*` applies. Kept apart from the
+/// config so reloads and DPI changes never clobber it.
+padding_override: ?PaddingOverride = null,
+
 /// The renderer for this surface.
 renderer: Renderer,
 
@@ -2604,11 +2609,71 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
 /// Recalculate the balanced padding if needed.
 fn balancePaddingIfNeeded(self: *Surface) void {
-    if (self.config.window_padding_balance == .false) return;
+    if (!self.isPaddingBalanced()) return;
     const content_scale = try self.rt_surface.getContentScale();
     const x_dpi = content_scale.x * font.face.default_dpi;
     const y_dpi = content_scale.y * font.face.default_dpi;
-    self.size.balancePadding(self.config.scaledPadding(x_dpi, y_dpi), self.config.window_padding_balance);
+    self.size.balancePadding(self.explicitPadding(x_dpi, y_dpi), self.config.window_padding_balance);
+}
+
+/// Padding pinned by the embedder on a subset of sides, in points. A null
+/// side falls back to the config value. See `setPaddingOverride`.
+pub const PaddingOverride = struct {
+    top: ?u32 = null,
+    bottom: ?u32 = null,
+    left: ?u32 = null,
+    right: ?u32 = null,
+};
+
+/// Whether `window-padding-balance` redistributes this surface's padding.
+/// A pin makes the pinned values authoritative instead: balancing would
+/// hand the slack back to the sides the embedder zeroed on purpose.
+fn isPaddingBalanced(self: *const Surface) bool {
+    return self.padding_override == null and self.config.window_padding_balance != .false;
+}
+
+/// The explicit (unbalanced) padding for this surface at the given DPI:
+/// the config's `window-padding-*`, except on sides the embedder pinned.
+/// Every path that recomputes padding after init goes through here, so an
+/// override survives config reloads and DPI changes alike.
+fn explicitPadding(self: *const Surface, x_dpi: f32, y_dpi: f32) rendererpkg.Padding {
+    var padding = self.config.scaledPadding(x_dpi, y_dpi);
+    const override = self.padding_override orelse return padding;
+    if (override.top) |points| padding.top = scalePadding(points, y_dpi);
+    if (override.bottom) |points| padding.bottom = scalePadding(points, y_dpi);
+    if (override.left) |points| padding.left = scalePadding(points, x_dpi);
+    if (override.right) |points| padding.right = scalePadding(points, x_dpi);
+    return padding;
+}
+
+/// Points to device pixels, the same way `DerivedConfig.scaledPadding` does.
+fn scalePadding(points: u32, dpi: f32) u32 {
+    const value: f32 = @floatFromInt(points);
+    return @intFromFloat(@floor(value * dpi / 72));
+}
+
+/// Pin the padding on any subset of sides, in points, or clear the pin
+/// with null. An embedder that tiles surfaces edge to edge — one tmux
+/// window drawn as several panes — needs zero padding where two surfaces
+/// meet and the configured padding only along the outer edges. That is a
+/// property of where the surface sits, not of the user's config, so it is
+/// surface state rather than a config field. Applies immediately, the way
+/// a DPI change does.
+pub fn setPaddingOverride(self: *Surface, override: ?PaddingOverride) !void {
+    self.padding_override = override;
+
+    const content_scale = try self.rt_surface.getContentScale();
+    const x_dpi = content_scale.x * font.face.default_dpi;
+    const y_dpi = content_scale.y * font.face.default_dpi;
+    if (self.isPaddingBalanced()) {
+        self.balancePaddingIfNeeded();
+    } else {
+        self.size.padding = self.explicitPadding(x_dpi, y_dpi);
+    }
+
+    // Force a resize event because the change in padding will affect
+    // pixel-level changes to the renderer and viewport.
+    try self.resize(self.size.screen);
 }
 
 /// Called to set the preedit state for character input. Preedit is used
@@ -3798,8 +3863,8 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 
     // Update our padding which is dependent on DPI. We only do this for
     // unbalanced padding since balanced padding is not dependent on DPI.
-    if (self.config.window_padding_balance == .false) {
-        self.size.padding = self.config.scaledPadding(x_dpi, y_dpi);
+    if (!self.isPaddingBalanced()) {
+        self.size.padding = self.explicitPadding(x_dpi, y_dpi);
     }
 
     // Force a resize event because the change in padding will affect

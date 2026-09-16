@@ -1051,6 +1051,24 @@ pub const Surface = struct {
         };
     }
 
+    /// Pin the padding on any subset of sides, in points. A negative value
+    /// keeps the configured padding for that side; all four negative
+    /// clears the pin. See `CoreSurface.setPaddingOverride` for why this
+    /// is surface state rather than config.
+    pub fn setPadding(self: *Surface, top: i32, bottom: i32, left: i32, right: i32) void {
+        const override: CoreSurface.PaddingOverride = .{
+            .top = if (top < 0) null else @intCast(top),
+            .bottom = if (bottom < 0) null else @intCast(bottom),
+            .left = if (left < 0) null else @intCast(left),
+            .right = if (right < 0) null else @intCast(right),
+        };
+        const pinned = override.top != null or override.bottom != null or
+            override.left != null or override.right != null;
+        self.core_surface.setPaddingOverride(if (pinned) override else null) catch |err| {
+            log.err("error setting padding override err={}", .{err});
+        };
+    }
+
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
         // We are an embedded API so the caller can send us all sorts of
         // garbage. We want to make sure that the float values are valid
@@ -2059,6 +2077,19 @@ pub const CAPI = struct {
     /// Update the content scale of the surface.
     export fn ghostty_surface_set_content_scale(surface: *Surface, x: f64, y: f64) void {
         surface.updateContentScale(x, y);
+    }
+
+    /// Pin a surface's padding per side, in points. A negative value keeps
+    /// the configured padding for that side. The pin survives config
+    /// reloads; pass all negatives to clear it.
+    export fn ghostty_surface_set_padding(
+        surface: *Surface,
+        top: i32,
+        bottom: i32,
+        left: i32,
+        right: i32,
+    ) void {
+        surface.setPadding(top, bottom, left, right);
     }
 
     /// Update the focused state of a surface.
