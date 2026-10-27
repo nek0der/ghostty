@@ -915,6 +915,38 @@ typedef struct {
   int8_t progress;
 } ghostty_action_progress_report_s;
 
+// terminal.osc.Command.ProgramStatus.State
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_IDLE,
+  GHOSTTY_PROGRAM_STATUS_WORKING,
+  GHOSTTY_PROGRAM_STATUS_DONE,
+  GHOSTTY_PROGRAM_STATUS_BLOCKED,
+  GHOSTTY_PROGRAM_STATUS_ERROR,
+  GHOSTTY_PROGRAM_STATUS_CLEAR,
+} ghostty_action_program_status_state_e;
+
+// terminal.osc.Command.ProgramStatus.Kind
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION,
+  GHOSTTY_PROGRAM_STATUS_KIND_QUESTION,
+  GHOSTTY_PROGRAM_STATUS_KIND_AUTH,
+} ghostty_action_program_status_kind_e;
+
+// apprt.action.ProgramStatus.C
+typedef struct {
+  // The program's stable name (e.g. "claude-code"), or "" if it sent none.
+  const char* app;
+  // The record the report is about, or "" for the program itself.
+  const char* id;
+  ghostty_action_program_status_state_e state;
+  // -1 if no kind was reported, otherwise a
+  // ghostty_action_program_status_kind_e. Only set for a blocked state.
+  int8_t kind;
+  // -1 if no progress was reported, otherwise 0-100 indicating percent
+  // completeness.
+  int8_t progress;
+} ghostty_action_program_status_s;
+
 // apprt.action.CommandFinished.C
 typedef struct {
   // -1 if no exit code was reported, otherwise 0-255
@@ -1017,6 +1049,7 @@ typedef enum {
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
+  GHOSTTY_ACTION_PROGRAM_STATUS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1055,6 +1088,7 @@ typedef union {
   ghostty_action_close_tab_mode_e close_tab_mode;
   ghostty_surface_message_childexited_s child_exited;
   ghostty_action_progress_report_s progress_report;
+  ghostty_action_program_status_s program_status;
   ghostty_action_command_finished_s command_finished;
   ghostty_action_start_search_s start_search;
   ghostty_action_search_total_s search_total;

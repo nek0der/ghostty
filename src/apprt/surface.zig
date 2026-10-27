@@ -57,6 +57,62 @@ pub const Message = union(enum) {
         }
     };
 
+    /// A fixed-size OSC 7501 report sent to the app thread. The report's
+    /// values point into the parser's buffer, so we copy the ones we
+    /// forward. The spec limits `app` and `id`, and a report that breaks a
+    /// limit never parses, so both always fit. `title` and `msg` are left
+    /// out to keep the message small.
+    pub const ProgramStatus = struct {
+        const Command = terminal.osc.Command.ProgramStatus;
+        const Report = Command.Report;
+        const limits = terminal.osc.program_status;
+
+        state: Command.State,
+        kind: ?Command.Kind,
+        progress: ?u8,
+        app: [limits.max_app_bytes:0]u8,
+        id: [limits.max_id_bytes:0]u8,
+
+        pub fn init(report: Report) ProgramStatus {
+            var result: ProgramStatus = .{
+                .state = report.state,
+                .kind = report.readOption(.kind),
+                .progress = report.readOption(.progress),
+                .app = undefined,
+                .id = undefined,
+            };
+            copyZ(result.app.len, &result.app, report.readOption(.app) orelse "");
+            copyZ(result.id.len, &result.id, report.readOption(.id) orelse "");
+            return result;
+        }
+
+        /// The record of every program in the surface removed at once, as
+        /// a full reset removes it.
+        pub const clear_all: ProgramStatus = .{
+            .state = .clear,
+            .kind = null,
+            .progress = null,
+            .app = @splat(0),
+            .id = @splat(0),
+        };
+
+        pub fn action(self: *const ProgramStatus) apprt.action.ProgramStatus {
+            return .{
+                .state = self.state,
+                .kind = self.kind,
+                .progress = self.progress,
+                .app = std.mem.sliceTo(&self.app, 0),
+                .id = std.mem.sliceTo(&self.id, 0),
+            };
+        }
+
+        fn copyZ(comptime capacity: usize, dst: *[capacity:0]u8, src: []const u8) void {
+            const len = @min(src.len, capacity);
+            @memcpy(dst[0..len], src[0..len]);
+            dst[len] = 0;
+        }
+    };
+
     /// Set the title of the surface.
     /// TODO: we should change this to a "WriteReq" style structure in
     /// the termio message so that we can more efficiently send strings
@@ -139,6 +195,9 @@ pub const Message = union(enum) {
 
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
+
+    /// A program reported its status (OSC 7501).
+    program_status: ProgramStatus,
 
     /// A command has started in the shell, start a timer.
     start_command,
@@ -321,4 +380,33 @@ test "copyUtf8Z preserves UTF-8 that fits" {
     Message.DesktopNotification.copyUtf8Z(dst.len, &dst, "abcЯ");
 
     try std.testing.expectEqualStrings("abcЯ", std.mem.sliceTo(&dst, 0));
+}
+
+test "ProgramStatus init copies what the action forwards" {
+    const testing = std.testing;
+
+    var p: terminal.osc.Parser = .init(testing.allocator);
+    defer p.deinit();
+    p.nextSlice("7501;state=blocked:app=claude-code:id=deploy/us-east:kind=permission:progress=40");
+    const cmd = p.end('\x1b') orelse return error.TestUnexpectedResult;
+
+    const status: Message.ProgramStatus = .init(cmd.program_status.report);
+    const action = status.action();
+    try testing.expectEqual(.blocked, action.state);
+    try testing.expectEqual(.permission, action.kind.?);
+    try testing.expectEqual(@as(?u8, 40), action.progress);
+    try testing.expectEqualStrings("claude-code", action.app);
+    try testing.expectEqualStrings("deploy/us-east", action.id);
+
+    const c = action.cval();
+    try testing.expectEqualStrings("claude-code", std.mem.span(c.app));
+    try testing.expectEqual(@as(i8, 40), c.progress);
+}
+
+test "ProgramStatus clear_all names no app and no record" {
+    const action = Message.ProgramStatus.clear_all.action();
+    try std.testing.expectEqual(.clear, action.state);
+    try std.testing.expectEqualStrings("", action.app);
+    try std.testing.expectEqualStrings("", action.id);
+    try std.testing.expectEqual(@as(i8, -1), action.cval().kind);
 }

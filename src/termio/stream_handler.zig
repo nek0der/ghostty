@@ -345,6 +345,7 @@ pub const StreamHandler = struct {
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
+            .program_status => self.programStatus(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
@@ -385,7 +386,6 @@ pub const StreamHandler = struct {
             .title_pop,
             .kitty_dnd,
             .osc_unknown,
-            .program_status,
             => {},
         }
     }
@@ -942,6 +942,9 @@ pub const StreamHandler = struct {
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
+
+        // A reset program has no status left to show.
+        self.surfaceMessageWriter(.{ .program_status = .clear_all });
     }
 
     /// Record a Kitty clipboard protocol session grant so future
@@ -1947,6 +1950,30 @@ pub const StreamHandler = struct {
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
+
+    /// Forward an OSC 7501 report to the apprt, or answer a program that
+    /// asks whether we support the protocol. The answer is always the same
+    /// fixed bytes; the spec never allows sending report contents back.
+    fn programStatus(self: *StreamHandler, cmd: terminal.osc.Command.ProgramStatus) void {
+        switch (cmd) {
+            .report => |report| self.surfaceMessageWriter(.{
+                .program_status = .init(report),
+            }),
+            .query => |terminator| self.programStatusQuery(terminator),
+        }
+    }
+
+    /// Answer a support query, ended with the query's own terminator so
+    /// the program recognizes the reply.
+    fn programStatusQuery(self: *StreamHandler, terminator: terminal.osc.Terminator) void {
+        switch (terminator) {
+            inline else => |t| self.messageWriter(.{
+                .write_stable = "\x1b]7501;" ++
+                    terminal.osc.program_status.query_reply ++
+                    comptime t.string(),
+            }),
+        }
+    }
 };
 
 test "kitty clipboard read: targets-only never consumes a one-time grant" {
@@ -2021,5 +2048,40 @@ test "kitty clipboard write: oversized text replies EFBIG" {
 
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "program status query: answers with the protocol's reply and terminator" {
+    const testing = std.testing;
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = undefined,
+    };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+
+    // Claude Code asks with BEL and only reports once a reply starts
+    // with `?`, so the reply has to end the way the query did.
+    handler.programStatusQuery(.bel);
+
+    const msg = mailbox.spsc.queue.pop(global.io()) orelse return error.TestUnexpectedResult;
+    defer msg.deinit();
+    switch (msg) {
+        .write_stable => |v| try testing.expectEqualStrings(
+            "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x07",
+            v,
+        ),
+        else => try testing.expect(false),
+    }
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
 }
