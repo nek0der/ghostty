@@ -364,6 +364,12 @@ pub const Action = union(Key) {
     /// split or the window is fullscreen.
     resize_window: ResizeWindow,
 
+    /// A program in the surface reported its status with the Program
+    /// Status Protocol (OSC 7501). Each report replaces the record its id
+    /// names; one without an id is about the program itself. A `clear`
+    /// state removes the record and every record beneath it.
+    program_status: ProgramStatus,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -436,6 +442,7 @@ pub const Action = union(Key) {
         copy_title_to_clipboard,
         move_tab_to_new_window,
         resize_window,
+        program_status,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -743,6 +750,52 @@ pub const InitialSize = extern struct {
 pub const ResizeWindow = extern struct {
     width: u32,
     height: u32,
+};
+
+pub const ProgramStatus = struct {
+    state: State,
+    kind: ?Kind = null,
+    progress: ?u8 = null,
+    app: [:0]const u8 = "",
+    id: [:0]const u8 = "",
+
+    pub const State = terminal.osc.Command.ProgramStatus.State;
+    pub const Kind = terminal.osc.Command.ProgramStatus.Kind;
+
+    // Sync with: ghostty_action_program_status_s
+    pub const C = extern struct {
+        app: [*:0]const u8,
+        id: [*:0]const u8,
+        state: c_int,
+        kind: i8,
+        progress: i8,
+    };
+
+    pub fn cval(self: ProgramStatus) C {
+        return .{
+            .app = self.app.ptr,
+            .id = self.id.ptr,
+            .state = @intFromEnum(self.state),
+            .kind = if (self.kind) |kind| @intFromEnum(kind) else -1,
+            .progress = if (self.progress) |progress| @intCast(@min(progress, 100)) else -1,
+        };
+    }
+
+    /// The same enum with a C tag, for comparing with ghostty.h.
+    fn CEnum(comptime E: type) type {
+        const names = @typeInfo(E).@"enum".field_names;
+        var keys: [names.len]?[:0]const u8 = undefined;
+        for (names, &keys) |name, *key| key.* = name;
+        return lib.Enum(.c, &keys);
+    }
+
+    test "ghostty.h ProgramStatus.State" {
+        try lib.checkGhosttyHEnum(CEnum(State), "GHOSTTY_PROGRAM_STATUS_");
+    }
+
+    test "ghostty.h ProgramStatus.Kind" {
+        try lib.checkGhosttyHEnum(CEnum(Kind), "GHOSTTY_PROGRAM_STATUS_KIND_");
+    }
 };
 
 pub const CellSize = extern struct {
